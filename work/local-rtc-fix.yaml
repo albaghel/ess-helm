@@ -1,0 +1,8 @@
+matrixRTC:
+  sfu:
+    additional:
+      local-ip-fix:
+        config: |
+          rtc:
+            use_external_ip: false
+            node_ip: "127.0.0.1"

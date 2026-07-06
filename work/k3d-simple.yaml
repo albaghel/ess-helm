@@ -1,0 +1,36 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: ess-helm
+image: rancher/k3s:v1.34.2-k3s1
+agents: 0
+servers: 1
+ports:
+- port: 127.0.0.1:80:80
+  nodeFilters: [loadbalancer]
+- port: 127.0.0.1:443:443
+  nodeFilters: [loadbalancer]
+- port: 127.0.0.1:30000-30100:30000-30100
+  nodeFilters: [server:*]
+options:
+  k3d:
+    wait: true
+  k3s:
+    extraArgs:
+    - arg: "--kube-apiserver-arg=service-node-port-range=30000-30100"
+      nodeFilters: [servers:*]
+  runtime:
+    ulimits:
+    - name: nofile
+      soft: 100000
+      hard: 100000
+registries:
+  create:
+    name: k3d-ess-helm-registry
+    host: 127.0.0.1
+    hostPort: "5000"
+  config: |
+    mirrors:
+      "localhost:5000":
+        endpoint:
+          - http://k3d-ess-helm-registry:5000
