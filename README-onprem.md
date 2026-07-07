@@ -1,122 +1,63 @@
-# ESS Community — On-Premise Ubuntu Server Deploy
+# Deploying ESS Community on an on-prem / self-hosted Ubuntu server
 
-Deploy the full Element Server Suite (Matrix homeserver stack) on a **self-hosted, on-premise Ubuntu server** — your own hardware/VM, not a cloud provider. Covers everything start to end: OS prep, networking, K3s (single-node Kubernetes), TLS, the Helm install, and how the whole system fits together.
+This is a full walkthrough for standing up Element Server Suite Community (the Matrix homeserver stack: Synapse, Matrix Authentication Service, Element Web/Admin, RTC backend, HAProxy, Postgres) on a single Ubuntu box you control — bare metal, home server, or a plain VPS/EC2 instance where you're not using any managed Kubernetes service. Everything runs through K3s on the one machine.
 
----
+Written from an actual deploy, including the parts that didn't work on the first try.
 
-## 1. Architecture — how this project works
+## What you're actually building
 
-ESS Community is a **Helm chart** (`charts/matrix-stack`) that deploys a full Matrix homeserver as a set of pods on a **Kubernetes cluster**. On-prem, that cluster is a single-node **K3s** install running directly on your Ubuntu box — no cloud APIs, no managed services, everything lives on your hardware.
+K3s gives you a one-node Kubernetes cluster. Traefik (bundled with K3s) sits on ports 80/443 and routes by hostname to HAProxy, which in turn routes Matrix API traffic to Synapse or MAS depending on the path. Everything else — Postgres, Redis, the RTC/SFU media server, Element's web clients — runs as pods alongside them. cert-manager talks to Let's Encrypt and keeps the TLS certs current without you touching them again.
 
-```
-                         Your Ubuntu Server (bare metal / VM)
-                         ┌─────────────────────────────────────────────┐
-Internet/LAN ── 80/443 ──┤  K3s (single-node Kubernetes)                │
-   │                     │                                             │
-   │                     │  Traefik (Ingress) ──┐                      │
-   │                     │                       ▼                     │
-   │                     │   ┌────────────── HAProxy ─────────────┐    │
-   │                     │   │  routes /_matrix, /.well-known,    │    │
-   │                     │   │  auth endpoints to the right pod    │    │
-   │                     │   └──────┬──────────┬──────────┬───────┘    │
-   │                     │          ▼          ▼          ▼            │
-   │                     │      Synapse      MAS      Element Web /    │
-   │                     │    (Matrix HS)  (OIDC auth)  Admin (static)  │
-   │                     │          │          │                       │
-   │                     │          ▼          ▼                       │
-   │                     │       PostgreSQL (bundled, or external)     │
-   │                     │          ▲                                 │
-   │                     │      Redis (Synapse worker pub/sub)         │
-   │                     │                                             │
- 30001/tcp,30002/udp ────┤  Matrix RTC Backend (LiveKit SFU) — calls   │
-                         └─────────────────────────────────────────────┘
+None of this needs cloud APIs. If the box has a public IP and you can open a few ports, this works the same on a home server as it does on EC2.
+
+## Before you start
+
+**Hardware.** 2 cores / 2GB RAM is the floor, but you'll be swapping constantly. 4 cores and 8GB is a saner minimum once Synapse, Postgres and the RTC service are all running together. Give it real disk too — 20GB is not enough headroom once you account for container images plus a growing Postgres + media volume; go for 40-50GB+ if you can. Default cloud images often ship with a tiny root volume (8GB is common on some AWS AMIs) — check `df -h /` before you install anything, it's much easier to grow the disk now than after K3s has already written a gigabyte of image layers to it.
+
+If you do need to grow an EBS-backed root volume after the fact: resize the volume in the AWS console (or `aws ec2 modify-volume`), then on the instance:
+
+```bash
+lsblk                              # confirm the disk shows the new, bigger size
+sudo growpart /dev/nvme0n1 1       # or /dev/xvda 1 on older instance types — check lsblk output
+sudo resize2fs /dev/nvme0n1p1      # match the partition name from growpart's output
+df -h /                            # should show the new size now
 ```
 
-**Component roles:**
+This works live, no reboot, no downtime.
 
-| Component | Role |
-|---|---|
-| **K3s** | Lightweight Kubernetes distribution. Runs all ESS pods, manages storage, networking, and the built-in Traefik ingress/load balancer. |
-| **Traefik** | K3s's bundled ingress controller. Terminates TLS (or passes it through) and routes incoming HTTP(S) to the right internal service based on hostname. |
-| **cert-manager** | Kubernetes operator that talks to Let's Encrypt (ACME) and auto-issues/renews TLS certs, stored as Kubernetes Secrets. |
-| **HAProxy** | Sits behind Traefik. Load-balances Matrix API traffic across Synapse worker processes and MAS, and serves the `/.well-known/matrix` + `/.well-known/element` discovery files needed for federation and client auto-discovery. |
-| **Synapse** | The actual Matrix homeserver — handles rooms, events, federation with other Matrix servers, media. Can scale to multiple worker processes. |
-| **Redis** | Pub/sub bus letting Synapse's main process and worker processes talk to each other. |
-| **Matrix Authentication Service (MAS)** | OIDC-based auth/identity service. Owns login, registration, sessions — Synapse delegates auth to it. |
-| **PostgreSQL** | Primary datastore: accounts, room state, messages, device keys, MAS data. Chart bundles one by default; production should point at an external instance you manage/back up yourself. |
-| **Element Web** | Browser chat client, preconfigured to point at your homeserver. |
-| **Element Admin** | Web-based admin console for the deployment. |
-| **Matrix RTC Backend (LiveKit SFU)** | Media server that powers Element Call (voice/video). Needs its own exposed ports (TCP 30001 / UDP 30002) since it's not plain HTTP. |
-| **Hookshot** (optional, off by default) | Bridges GitHub/GitLab/JIRA/webhooks into Matrix rooms. |
+**A domain, or not.** You need something to be the "server name" — the part after the `:` in a Matrix ID (`@alice:example.com`). If you own a domain, use it and point DNS records at your public IP:
 
-**Request flow example** (loading Element Web and sending a message):
-1. Browser hits `https://element.<server-name>` → DNS resolves to your server's public IP → K3s's Traefik terminates TLS → serves static Element Web assets.
-2. Element Web calls `https://<server-name>/.well-known/matrix/client` to discover the homeserver + MAS URLs.
-3. Login goes to MAS (`account.<server-name>`) which issues an OIDC token.
-4. Element Web then talks to Synapse (`matrix.<server-name>`) using that token for all `/_matrix` API calls — HAProxy routes these to the Synapse (or worker) pod.
-5. Synapse persists the message to PostgreSQL and, if other homeservers are in the room, federates the event out over the internet directly from Synapse.
+```
+example.com          A  <your public IP>
+synapse.example.com  A  <your public IP>
+account.example.com  A  <your public IP>
+mrtc.example.com      A  <your public IP>
+element.example.com  A  <your public IP>
+admin.example.com    A  <your public IP>
+```
 
-Everything is deployed/upgraded declaratively via `helm upgrade --install`, driven by one or more small YAML "values" files you author (hostnames, TLS, DB config, etc.) — the chart wires the rest together.
+If you're just testing and don't want to buy a domain yet, `nip.io` resolves any `<anything>.<your-ip-with-dashes>.nip.io` straight to that IP with zero DNS setup — e.g. if your IP is `98.80.225.142`, then `element.98-80-225-142.nip.io` just works. Fine for a test box, not something you'd want long-term (the server name can't be changed later without wiping the database, so treat this as throwaway if you go this route).
 
----
+**Ports.** Open on the host and in whatever's in front of it (router, cloud security group):
 
-## 2. Prerequisites
-
-### Hardware / OS
-
-| Requirement | Minimum | Recommended |
+| Port | Proto | For |
 |---|---|---|
-| OS | Ubuntu 22.04 LTS or 24.04 LTS (x86_64 or arm64) | 24.04 LTS |
-| CPU | 2 cores | 4+ cores |
-| RAM | 2 GB | 8 GB+ (Synapse + Postgres + RTC add up) |
-| Disk | 20 GB free | 100 GB+ SSD (media uploads + Postgres grow over time) |
-| Network | Static LAN IP, root/sudo access | Static public IP or DDNS, port-forwarding control on your router/firewall |
+| 22 | tcp | SSH |
+| 80 | tcp | HTTP → HTTPS redirect, and Let's Encrypt's HTTP-01 challenge |
+| 443 | tcp | everything else |
+| 30001 | tcp | RTC/SFU, WebRTC TCP fallback |
+| 30002 | udp | RTC/SFU, WebRTC media |
 
-### Domain & DNS
+If you're on a cloud provider, this is a security group setting, not a `ufw` setting — `ufw` only matters for traffic that already reached the box.
 
-You need a domain you control DNS for (a subdomain of one you own is fine). Choose a **server name**, e.g. `example.com` — this becomes the tail of every Matrix ID: `@alice:example.com`.
-
-> **The server name cannot be changed later without recreating the database.** Pick it carefully.
-
-Create these DNS records, all pointing at your server's **public IP** (or the IP your router forwards from, if home-hosted):
-
-```
-example.com          A  <YOUR_PUBLIC_IP>   # server name + .well-known
-synapse.example.com  A  <YOUR_PUBLIC_IP>
-account.example.com  A  <YOUR_PUBLIC_IP>   # Matrix Authentication Service
-mrtc.example.com      A  <YOUR_PUBLIC_IP>   # Matrix RTC
-element.example.com  A  <YOUR_PUBLIC_IP>   # Element Web
-admin.example.com    A  <YOUR_PUBLIC_IP>   # Element Admin
-```
-
-Wait for propagation before continuing: `dig element.example.com`.
-
-### Network / firewall ports
-
-Open (forward, if behind a home router/NAT) these on the server:
-
-| Port | Protocol | Purpose |
-|---|---|---|
-| 22 | TCP | SSH (restrict source IP if possible) |
-| 80 | TCP | HTTP → redirects to HTTPS, also used for Let's Encrypt HTTP-01 challenge |
-| 443 | TCP | HTTPS for all web-facing services |
-| 30001 | TCP | Matrix RTC WebRTC (TCP fallback) |
-| 30002 | UDP | Matrix RTC WebRTC (media) |
-
-If the server is behind a NAT router (common on-prem/home scenario), forward these ports from the router to the server's LAN IP, and also open them in `ufw` on the host itself (see below).
-
----
-
-## 3. Step 1 — Base OS setup
+## 1. Base OS
 
 ```bash
 sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y curl git jq ufw
 ```
 
-Set a static LAN IP (via netplan or your router's DHCP reservation) so the server's address never changes under K3s.
-
-Configure the firewall:
+Firewall, if you're using one on the host itself:
 
 ```bash
 sudo ufw allow 22/tcp
@@ -125,18 +66,15 @@ sudo ufw allow 443/tcp
 sudo ufw allow 30001/tcp
 sudo ufw allow 30002/udp
 sudo ufw enable
-sudo ufw status
 ```
 
----
-
-## 4. Step 2 — Install K3s (single-node Kubernetes)
+## 2. K3s
 
 ```bash
 curl -sfL https://get.k3s.io | sh -
 ```
 
-Give your user kubectl access:
+Give yourself kubectl access instead of always sudo'ing:
 
 ```bash
 mkdir -p ~/.kube
@@ -147,33 +85,18 @@ echo 'export KUBECONFIG=~/.kube/config' >> ~/.bashrc
 export KUBECONFIG=~/.kube/config
 
 kubectl get nodes
-# NAME       STATUS   ROLES                  AGE   VERSION
-# <host>     Ready    control-plane,master   30s   v1.3x.x
 ```
 
-K3s stores persistent volumes under `/var/lib/rancher/k3s/storage/` by default. If your fast disk is mounted elsewhere (e.g. a dedicated SSD/NVMe), either mount it at `/var` before install, or reinstall with:
+Should show one node, `Ready`.
+
+## 3. Helm
 
 ```bash
-export K3S_DATA_DIR=/mnt/fast-disk/k3s
-curl -sfL https://get.k3s.io | sh -
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version --short
 ```
 
-### (Optional) If port 80/443 is already taken by an existing reverse proxy
-
-If your on-prem box already runs Apache/Nginx/Caddy for other sites, have K3s's Traefik listen on alternate ports instead and forward to it from your existing proxy — see the [main README's "Using an existing reverse proxy" section](README.md#using-an-existing-reverse-proxy) for the full config and example vhosts (Apache2/Nginx/Caddy).
-
----
-
-## 5. Step 3 — Install Helm 3
-
-```bash
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-helm version --short   # must print v3.x.x
-```
-
----
-
-## 6. Step 4 — Install cert-manager + Let's Encrypt
+## 4. cert-manager + Let's Encrypt
 
 ```bash
 helm upgrade --install cert-manager \
@@ -183,13 +106,29 @@ helm upgrade --install cert-manager \
   --set crds.enabled=true \
   --timeout 10m --wait
 
-kubectl get pods -n cert-manager
-# all 3 pods must show 1/1 Running
+kubectl get pods -n cert-manager   # 3 pods, all 1/1 Running
 ```
 
-Create the ACME ClusterIssuer (replace the email — Let's Encrypt sends expiry notices there):
+Create both a staging and a production issuer. Deploy against staging first — it proves the HTTP-01 challenge path actually reaches your box (i.e. your ports/DNS/security-group setup is right) without burning a real Let's Encrypt request or risking their rate limit while you're still debugging:
 
 ```bash
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+    - http01:
+        ingress:
+          class: traefik
+EOF
+
 kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -198,7 +137,7 @@ metadata:
 spec:
   acme:
     server: https://acme-v02.api.letsencrypt.org/directory
-    email: your@email.com
+    email: you@example.com
     privateKeySecretRef:
       name: letsencrypt-prod
     solvers:
@@ -208,56 +147,51 @@ spec:
 EOF
 ```
 
-> To avoid Let's Encrypt rate limits while testing, first point `server` at `https://acme-staging-v02.api.letsencrypt.org/directory` with a `letsencrypt-staging` name, verify it works, then switch to prod.
-
-If you'd rather use your own certificate files instead of Let's Encrypt, see [README.md → Certificate File](README.md#certificate-file).
-
----
-
-## 7. Step 5 — Configure and deploy ESS
+## 5. Values files
 
 ```bash
-git clone https://github.com/element-hq/ess-helm.git
-cd ess-helm
 mkdir -p ~/ess-values
 kubectl create namespace ess
 ```
 
-**`~/ess-values/hostnames.yaml`**:
+`~/ess-values/hostnames.yaml` — mind the schema here, it's nested under `ingress:`, not a flat `hostname:` key (older docs floating around show the flat form, it'll get rejected by the chart's schema validation with an "additional properties not allowed" error):
 
-```bash
-cat > ~/ess-values/hostnames.yaml <<EOF
+```yaml
 serverName: example.com
 
 synapse:
-  hostname: synapse.example.com
+  ingress:
+    host: synapse.example.com
 
 matrixAuthenticationService:
-  hostname: account.example.com
+  ingress:
+    host: account.example.com
 
 matrixRTC:
-  hostname: mrtc.example.com
+  ingress:
+    host: mrtc.example.com
 
 elementWeb:
-  hostname: element.example.com
+  ingress:
+    host: element.example.com
 
 elementAdmin:
-  hostname: admin.example.com
-EOF
+  ingress:
+    host: admin.example.com
 ```
 
-**`~/ess-values/tls.yaml`**:
+If the exact shape ever drifts again, the source of truth is `charts/matrix-stack/ci/fragments/quick-setup-hostnames.yaml` in this repo, not any prose doc — copy from there directly if in doubt.
 
-```bash
-cat > ~/ess-values/tls.yaml <<EOF
+`~/ess-values/tls.yaml` — start on staging:
+
+```yaml
 certManager:
-  clusterIssuer: letsencrypt-prod
-EOF
+  clusterIssuer: letsencrypt-staging
 ```
 
-By default the chart deploys its own bundled PostgreSQL — fine to start with. For production, point at an external PostgreSQL instance you control (so you own backups/HA) — see [docs/advanced.md → Using a dedicated PostgreSQL database](docs/advanced.md#using-a-dedicated-postgresql-database) and copy `charts/matrix-stack/ci/fragments/quick-setup-postgresql.yaml` to `~/ess-values/postgresql.yaml`.
+By default the chart deploys its own Postgres. That's fine to get running and to test with; for anything you actually care about, point it at a Postgres instance you manage and back up yourself (see `docs/advanced.md`).
 
-Deploy:
+## 6. Deploy
 
 ```bash
 helm upgrade --install ess oci://ghcr.io/element-hq/ess-helm/matrix-stack \
@@ -266,47 +200,46 @@ helm upgrade --install ess oci://ghcr.io/element-hq/ess-helm/matrix-stack \
   -f ~/ess-values/tls.yaml \
   --wait --timeout 20m
 
-kubectl get pods -n ess -w
+kubectl get pods -n ess
 ```
 
-(Using the chart straight from the OCI registry, as above, is simpler for upgrades than deploying from the cloned repo path — pick one and stay consistent.)
+Once everything's up and the staging certs issued fine (`kubectl get certificate -n ess` — all `READY True`), switch to prod and re-run the same command with `clusterIssuer: letsencrypt-prod` in `tls.yaml`. Helm will just re-issue the real certs over the staging ones.
 
----
+## 7. First users
 
-## 8. Step 6 — Create your first user
-
-Registration is closed by default (prevents spam bots from finding your fresh server).
+Registration is closed by default on purpose — an internet-facing Matrix server with open registration gets found and farmed for spam accounts within hours.
 
 ```bash
 kubectl exec -n ess -it deploy/ess-matrix-authentication-service -- mas-cli manage register-user
 ```
 
-Non-interactive:
+Or non-interactively:
 
 ```bash
-kubectl exec -n ess deploy/ess-matrix-authentication-service \
-  -- mas-cli manage register-user --yes --password "YourStrongPassw0rd!" alice
+kubectl exec -n ess deploy/ess-matrix-authentication-service -- \
+  mas-cli manage register-user --yes --password 'something-strong' alice
 ```
 
-To let users self-register later, configure MAS with SMTP — see [docs/advanced.md → Configuring Matrix Authentication Service](docs/advanced.md#configuring-matrix-authentication-service). Never set `password_registration_email_required: false` without `registration_token_required: true`, or your server will get farmed for spam accounts.
+To let people register themselves later, MAS needs SMTP configured (see `docs/advanced.md`) — don't turn off email verification without also turning on registration tokens, or you're back to the spam problem.
 
----
-
-## 9. Step 7 — Verify
+## 8. Actually check it works
 
 ```bash
 curl https://example.com/.well-known/matrix/client
 curl https://example.com/.well-known/matrix/server
 ```
 
-- Open `https://element.example.com` and log in with the user you created.
-- Check federation: `https://federationtester.matrix.org/#example.com`
-- Log in from an Element X mobile client.
-- (Optional) install [k9s](https://k9scli.io/) for a terminal UI over the cluster: `sudo snap install k9s`.
+Both should return JSON pointing at your `synapse.` and `mrtc.` hosts.
 
----
+Federation check: `https://federationtester.matrix.org/#example.com` (or hit its API directly: `https://federationtester.matrix.org/api/report?server_name=example.com` and check `FederationOK` is `true`).
 
-## 10. Upgrades
+MAS is reachable and speaking OIDC if `https://account.example.com/.well-known/openid-configuration` returns something.
+
+The actual login has to happen in a browser — MAS is authorization_code-flow-only, there's no password endpoint you can curl to prove login end-to-end. Open `https://element.example.com` and log in with the account you made.
+
+## Upgrading later
+
+Same command as the install, run again:
 
 ```bash
 helm upgrade ess oci://ghcr.io/element-hq/ess-helm/matrix-stack \
@@ -316,49 +249,39 @@ helm upgrade ess oci://ghcr.io/element-hq/ess-helm/matrix-stack \
   --wait --timeout 20m
 ```
 
-Check the chart's release notes / `CHANGELOG.md` before upgrading across major versions.
+Check `CHANGELOG.md` before jumping major versions.
 
----
+## Backups
 
-## 11. Backups (your responsibility on-prem — no cloud snapshots)
+There's no cloud snapshot layer doing this for you here — it's on you:
 
-| What | How |
-|---|---|
-| PostgreSQL | `kubectl exec -n ess deploy/ess-postgresql -- pg_dumpall -U postgres > backup.sql`, cron this to local disk + copy off-box (NAS, another machine, offsite). |
-| Generated secrets | `kubectl get secret ess-generated -n ess -o yaml > ess-generated-secret.yaml` — store securely, needed to recover without regenerating creds. |
-| Media uploads | Persistent volume `ess-synapse-media`, backed by local disk under K3s's storage path. Snapshot at the filesystem/LVM level, or rsync to a NAS, or configure S3-compatible media storage instead (see [docs/advanced.md](docs/advanced.md)). |
+- Postgres: `kubectl exec -n ess deploy/ess-postgresql -- pg_dumpall -U postgres > backup.sql`, cron it, copy it off the box.
+- The generated secrets: `kubectl get secret ess-generated -n ess -o yaml > ess-generated-secret.yaml`. Needed to recover without regenerating every credential from scratch.
+- Media uploads live on the `ess-synapse-media` PVC, backed by local disk. Snapshot at the filesystem level or rsync it somewhere else. If a single disk failure would also wipe your only backup, that's not a backup.
 
-Since there's no cloud storage layer here, put backups on a **second physical disk or another machine** — a single-disk failure otherwise takes out both the live data and the backup.
+## Production checklist, if this stops being a test box
 
----
+- [ ] External Postgres, not the bundled one, with its own backup schedule
+- [ ] Media storage off local disk (S3-compatible or NFS) if you need it to survive a disk failure
+- [ ] SMTP on MAS so real registration/password-reset works
+- [ ] Firewall/security-group rules trimmed to just what's needed — don't leave a wide port range open for the sake of it
+- [ ] Prometheus Operator installed, if you want the `ServiceMonitor`s the chart already creates to do anything
+- [ ] Automated, off-host backups actually running, not just documented
+- [ ] Some thought given to what happens if the box loses power mid-write — single node, no failover
 
-## 12. Production hardening checklist
-
-- [ ] External PostgreSQL instance (not the bundled one) with its own backup schedule
-- [ ] S3-compatible (e.g. MinIO on a separate box) or NFS media storage instead of local PVC, if you need HA or off-host storage
-- [ ] SMTP configured on MAS, so real self-registration works
-- [ ] `ufw`/router rules restricted to only the ports actually needed (30001-30002 only for RTC — don't open a wide range)
-- [ ] Prometheus Operator installed → chart auto-creates `ServiceMonitor`s for metrics
-- [ ] Automated `pg_dump` + media backup cron, copied off-host
-- [ ] UPS / power protection — a single-node cluster has no failover if the box loses power mid-write
-
----
-
-## 13. Troubleshooting
+## Troubleshooting
 
 ```bash
 kubectl get pods -n ess
 kubectl logs -n ess deploy/ess-synapse
 kubectl logs -n ess deploy/ess-matrix-authentication-service
 kubectl logs -n ess deploy/ess-matrix-rtc-sfu
-kubectl describe certificate -n ess     # cert-manager / Let's Encrypt issues
+kubectl describe certificate -n ess     # cert-manager / Let's Encrypt stuck? start here
 ```
 
-More scenarios: [docs/troubleshooting.md](docs/troubleshooting.md).
+More scenarios in `docs/troubleshooting.md`.
 
----
-
-## 14. Uninstalling
+## Tearing it down
 
 ```bash
 helm uninstall ess -n ess
@@ -366,19 +289,11 @@ kubectl delete secrets/ess-generated -n ess
 kubectl delete configmap/ess-deployment-markers -n ess
 kubectl delete pvc/ess-synapse-media -n ess
 kubectl delete pvc/ess-postgres-data -n ess
-# or, to remove everything at once:
+# or just wipe the whole namespace:
 kubectl delete namespace ess
 
-# Remove cert-manager
 helm uninstall cert-manager -n cert-manager
-
-# Remove Helm
 rm -rf /usr/local/bin/helm $HOME/.cache/helm $HOME/.config/helm $HOME/.local/share/helm
-
-# Remove K3s
 /usr/local/bin/k3s-uninstall.sh
-
-# Remove local config
 rm -rf ~/ess-values ~/.kube
 ```
-</content>
