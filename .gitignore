@@ -7,7 +7,7 @@ __pycache__
 .ca
 .venv
 *.tgz
-charts/*/user_values/*.yaml
+
 .pyhelm_cache
 dist/
 MENTOR_LOG.md
