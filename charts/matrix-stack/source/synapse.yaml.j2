@@ -90,7 +90,7 @@ logging:
   levelOverrides: {}
 # Use 0 replicas to stop Synapse main process without removing routing to it
 replicas: 1
-{{- sub_schema_values.image(registry='oci.element.io', repository='synapse', tag='v1.155.0') }}
+{{- sub_schema_values.image(registry='oci.element.io', repository='synapse', tag='v1.156.0') }}
 {{- sub_schema_values.extraVolumes("Synapse", with_context=true) }}
 {{- sub_schema_values.extraVolumeMounts("Synapse", with_context=true) }}
 {{- sub_schema_values.extraInitContainers("Synapse") }}
@@ -101,14 +101,15 @@ replicas: 1
 {{- sub_schema_values.extraEnv() }}
 {{- sub_schema_values.hostAliases() }}
 {{- sub_schema_values.nodeSelector() }}
+{{- sub_schema_values.priorityClassName() }}
 {{- sub_schema_values.podSecurityContext(user_id='10091', group_id='10091') }}
 {{- sub_schema_values.resources(requests_memory='100Mi', requests_cpu='100m', limits_memory='4Gi') }}
 {{- sub_schema_values.serviceAccount() }}
 {{- sub_schema_values.serviceMonitors() }}
 {{- sub_schema_values.tolerations() }}
 {{- sub_schema_values.topologySpreadConstraints() }}
-{{- sub_schema_values.probe("liveness", failureThreshold=8, periodSeconds=6, timeoutSeconds=2) }}
-{{- sub_schema_values.probe("readiness", failureThreshold=8, periodSeconds=2, successThreshold=2, timeoutSeconds=2) }}
+{{- sub_schema_values.probe("liveness", failureThreshold=8, periodSeconds=6, timeoutSeconds=12) }}
+{{- sub_schema_values.probe("readiness", failureThreshold=8, periodSeconds=2, successThreshold=2, timeoutSeconds=12) }}
 {{- sub_schema_values.probe("startup", failureThreshold=54, periodSeconds=2) }}
 
 ## Extra command line arguments to provide to Synapse
