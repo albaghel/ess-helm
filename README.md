@@ -598,6 +598,8 @@ For common troubleshooting queries, please refer to the [Troubleshooting](docs/t
 
 For maintenance topics like upgrading, backups and restoring from backups, please refer to the [Maintenance](docs/maintenance.md) guide.
 
+If your server's public IP changes, or you're moving to a new server, see the [public IP change / server migration guide](README-ip-change.md).
+
 # Uninstalling
 
 If you wish to remove ESS Community from your cluster, you can simply run the following commands to clean up the installation.
