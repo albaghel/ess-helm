@@ -13,6 +13,7 @@ For the official upstream quick-setup guide (Let's Encrypt / reverse-proxy optio
 - [Production on-prem / EC2 deploy (K3s)](#production-on-prem--ec2-deploy-k3s)
 - [Changing the public IP / moving servers](#changing-the-public-ip--moving-servers)
 - [Custom config overrides](#custom-config-overrides)
+- [SSO / upstream OIDC (e.g. Keycloak)](#sso--upstream-oidc-eg-keycloak)
 - [Known gotchas](#known-gotchas)
 - [Services, licensing & cost](#services-licensing--cost)
 - [Scaling under load](#scaling-under-load)
@@ -517,6 +518,111 @@ Any Synapse setting can be injected this way under `synapse.additional.<name>.co
 
 ---
 
+## SSO / upstream OIDC (e.g. Keycloak)
+
+MAS has no dedicated Keycloak/SSO values schema in this chart. Wire any upstream OIDC provider (Keycloak, Authentik, Auth0, Okta, etc.) the same way as any other MAS setting — via the `matrixAuthenticationService.additional.<file>.config` passthrough — using MAS's own `upstream_oauth2.providers` config block. Full schema: [MAS configuration reference](https://element-hq.github.io/matrix-authentication-service/reference/configuration.html).
+
+Example, in `user_values/<yours>.yaml`:
+
+```yaml
+matrixAuthenticationService:
+  additional:
+    keycloak-oidc.yaml:
+      config: |
+        upstream_oauth2:
+          providers:
+            - id: 01HXXXXXXXXXXXXXXXXXXXXXXX   # must be a valid ULID
+              issuer: https://<your-idp-issuer-url>
+              human_name: SSO                  # controls only the "{name}" slot in Element Web's fixed "Continue with {name}" button text
+              client_id: <client id from your IdP>
+              client_secret: "<client secret from your IdP>"
+              token_endpoint_auth_method: client_secret_post
+              scope: "openid profile email"
+              claims_imports:
+                subject:
+                  template: "{{ user.sub }}"
+                localpart:
+                  action: suggest              # suggest lets the user edit their Matrix username on first login; use `force` to lock it to the IdP's username
+                  template: "{{ user.preferred_username }}"
+                displayname:
+                  action: suggest
+                  template: "{{ user.name }}"
+                email:
+                  action: suggest
+                  template: "{{ user.email }}"
+```
+
+On the IdP side (Keycloak, as the concrete example): create a realm, create an OpenID Connect client in it with **Client authentication ON** (confidential client, gives you a secret), **Standard flow** as the only enabled auth flow, and a **Valid redirect URI** of `https://<your-mas-host>/upstream/callback/<the same id you used above>` (a trailing `/*` wildcard works and survives you changing the ULID later without re-editing Keycloak).
+
+`helm upgrade` with the new config, restart MAS, then check it actually loaded the provider with no errors:
+
+```bash
+kubectl rollout restart deployment/ess-matrix-authentication-service -n ess
+kubectl logs -n ess deploy/ess-matrix-authentication-service --tail=100 | grep -i -E "provider|upstream_oauth|error"
+```
+
+A clean run shows `Updating provider provider.id=<your ULID>` and no `ERROR` lines.
+
+### If your IdP runs inside the same cluster (self-hosted, local/test setups)
+
+Three gotchas specific to this case, each confirmed by direct debugging rather than guessed:
+
+1. **Cluster DNS can't resolve your IdP's ingress hostname from inside pods.** This bites anyone using `*.<namespace>.localhost`-style hostnames (see [Local Mac dev deploy](#local-mac-dev-deploy-k3d)) — those only resolve via browser/OS loopback tricks on the host machine, not cluster DNS, so MAS's outbound HTTPS call fails with a DNS/connect error. Fix: teach CoreDNS to route that hostname to the ingress controller internally, via k3s's `coredns-custom` ConfigMap convention:
+
+   ```bash
+   kubectl apply -f - <<'EOF'
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: coredns-custom
+     namespace: kube-system
+   data:
+     idp.override: |
+       rewrite name exact <your-idp-hostname> traefik.kube-system.svc.cluster.local
+   EOF
+   kubectl rollout restart deployment/coredns -n kube-system
+   ```
+
+   Use `rewrite`, not a second `hosts {}` block — CoreDNS only allows one `hosts` plugin per server block, and k3s's default Corefile already has one (for `NodeHosts`); adding a second one crash-loops CoreDNS with `this plugin can only be used once per Server Block`. Swap `traefik.kube-system.svc.cluster.local` for whatever your ingress controller's in-cluster service DNS name actually is (`kubectl get svc -A | grep -i ingress` if unsure).
+
+2. **MAS won't trust a self-signed/internal CA.** MAS's container is a `GoogleContainerTools/distroless` Debian image — no shell, single cert bundle file at `/etc/ssl/certs/ca-certificates.crt`. If your IdP's TLS cert is signed by a local/self-signed CA (as with the local Mac deploy's `ess-ca`), MAS's TLS handshake fails with `UnknownIssuer`. Fix: build a merged bundle (the container's existing public CA bundle + your CA) and mount it back in over the same path:
+
+   ```bash
+   POD=$(kubectl get pod -n ess -l app.kubernetes.io/name=matrix-authentication-service -o jsonpath='{.items[0].metadata.name}')
+   kubectl debug -n ess pod/$POD --image=busybox:1.36 --target=matrix-authentication-service \
+     -- sh -c 'cat /proc/1/root/etc/ssl/certs/ca-certificates.crt' >/dev/null 2>&1
+   sleep 3
+   DBG=$(kubectl get pod -n ess $POD -o jsonpath='{.spec.ephemeralContainers[-1:].name}')
+   kubectl logs -n ess $POD -c "$DBG" > /tmp/debian-ca-bundle.crt
+
+   # pull your CA cert from wherever it lives — e.g. any cert-manager-issued TLS secret's ca.crt key
+   kubectl get secret <your-idp-tls-secret> -n ess -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/your-ca.crt
+
+   cat /tmp/debian-ca-bundle.crt /tmp/your-ca.crt > /tmp/merged-ca-bundle.crt
+   kubectl create configmap mas-ca-bundle -n ess --from-file=ca-certificates.crt=/tmp/merged-ca-bundle.crt
+   ```
+
+   Then mount it in `matrixAuthenticationService`, as a sibling of `additional`:
+
+   ```yaml
+   matrixAuthenticationService:
+     extraVolumes:
+       - name: mas-ca-bundle
+         configMap:
+           name: mas-ca-bundle
+     extraVolumeMounts:
+       - name: mas-ca-bundle
+         mountPath: /etc/ssl/certs/ca-certificates.crt
+         subPath: ca-certificates.crt   # overlays just this one file, leaves the rest of the bundle intact
+         readOnly: true
+   ```
+
+   None of this is needed against a real, publicly-trusted cert (Let's Encrypt etc.) — only against a self-signed/internal CA.
+
+3. **Verify the issuer URL actually resolves before wiring MAS**, rather than trusting that a realm/tenant was created correctly: `curl -sk -o /dev/null -w '%{http_code}\n' https://<issuer>/.well-known/openid-configuration` should return `200`. A `404` there usually means the realm/tenant name in your `issuer` URL doesn't match what actually exists on the IdP (e.g. a client got created in the IdP's default/admin realm instead of a dedicated one) — cheaper to catch with one `curl` than to debug it via MAS's logs.
+
+---
+
 ## Known gotchas
 
 | Issue | Cause | Fix |
@@ -528,6 +634,7 @@ Any Synapse setting can be injected this way under `synapse.additional.<name>.co
 | "Confirm digital identity" on first login | Normal MAS / E2E encryption device-verification flow | Generate a security key, or skip for dev |
 | `hostnames.yaml` rejected with "additional properties not allowed" | Flat `hostname:` key used instead of the schema's nested `ingress:` form | Use the nested form shown in [Production values files](#5-values-files), or copy `charts/matrix-stack/ci/fragments/quick-setup-hostnames.yaml` directly |
 | `values.yaml` edits don't take effect / get overwritten | It's a generated file (header says so) | Edit `source/values.yaml.j2` instead, or use `user_values/local.yaml` overrides for local-only changes |
+| A values override silently stops applying / MAS (or another component) crashes parsing its own config | Two top-level keys with the same name (e.g. two `matrixAuthenticationService:` blocks) in one values file — YAML lets the later one silently clobber the earlier one at the same nesting level | Keep exactly one top-level key per component per file; merge new fields (like `extraVolumes`) into the existing block instead of adding a second header |
 
 ---
 
