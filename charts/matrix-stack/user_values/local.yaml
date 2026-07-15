@@ -5,7 +5,3 @@ synapse:
         user_directory:
           enabled: true
           search_all_users: true
-
-wellKnownDelegation:
-  additional:
-    client: '{"io.element.e2ee": {"force_disable": true}}'
